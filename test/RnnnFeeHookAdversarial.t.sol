@@ -11,6 +11,7 @@ import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {BeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {PoolModifyLiquidityTest} from "v4-core/src/test/PoolModifyLiquidityTest.sol";
@@ -298,16 +299,28 @@ contract RnnnFeeHookAdversarialTest is Test {
         assertEq(hook.pendingFees(), 1 ether);
     }
 
-    /// @dev `beforeSwap` is a view: the manager calling it directly can read a delta but moves no
-    /// value, and a fake call cannot mint claims.
-    function test_beforeSwapFromTheManagerMovesNothing() public {
-        SwapParams memory params = SwapParams(!rnnnIsZero, -int256(100 ether), _limit(!rnnnIsZero));
+    /// @dev A fake `beforeSwap` from the manager's own address, outside any swap, moves no value.
+    /// When IMD is the specified currency the hook must simulate the swap, which needs the manager
+    /// unlocked, so the call fails with the manager's own `ManagerLocked`; when RNNN is specified
+    /// the hook answers the zero delta without touching the manager. Neither path mints a claim,
+    /// pays the recipient or overrides the LP fee.
+    function test_beforeSwapFromTheManagerOutsideASwapMovesNothing() public {
+        _addFullRange(key, 1e24);
+        SwapParams memory buy = SwapParams(!rnnnIsZero, -int256(100 ether), _limit(!rnnnIsZero));
         vm.prank(address(manager));
-        (bytes4 selector,, uint24 lpFeeOverride) = hook.beforeSwap(address(this), key, params, "");
+        vm.expectRevert(IPoolManager.ManagerLocked.selector);
+        hook.beforeSwap(address(this), key, buy, "");
+
+        SwapParams memory sell = SwapParams(rnnnIsZero, -int256(100 ether), _limit(rnnnIsZero));
+        vm.prank(address(manager));
+        (bytes4 selector, BeforeSwapDelta delta, uint24 lpFeeOverride) = hook.beforeSwap(address(this), key, sell, "");
         assertEq(selector, IHooks.beforeSwap.selector);
+        assertEq(BeforeSwapDelta.unwrap(delta), 0, "a swap that specifies RNNN takes nothing before the pool runs");
         assertEq(lpFeeOverride, 0, "the hook must never override the LP fee");
+
         assertEq(hook.pendingFees(), 0);
         assertEq(imd.balanceOf(RECIPIENT), 0);
+        assertEq(manager.balanceOf(address(hook), Currency.wrap(address(imd)).toId()), 0);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -344,14 +357,48 @@ contract RnnnFeeHookAdversarialTest is Test {
         assertEq(hook.pendingFees(), 0);
     }
 
-    /// @dev `beforeSwap` reverts if the fee cannot be expressed as an int128. The pool could never
-    /// settle such a swap either, so nothing is lost, but the revert is the hook's.
-    function test_beforeSwapRevertsOnAnAmountWhoseFeeExceedsInt128() public {
-        SwapParams memory params =
-            SwapParams(!rnnnIsZero, -int256(uint256(uint128(type(int128).max)) * 101), _limit(!rnnnIsZero));
-        vm.prank(address(manager));
+    /// @dev The largest exact input a pool delta can express, int128.max IMD, fills in full against
+    /// 1e24 of liquidity and pays exactly 1% of it. The fee (about 1.7e36) fits an int128 but dwarfs
+    /// the IMD the manager holds when the hook runs, so it is deferred as a claim; the router settles
+    /// the input right after, which backs the claim, and anyone can then redeem it to the recipient.
+    function test_exactInputBuyOfInt128MaxFillsAndPaysExactlyOnePercent() public {
+        _addFullRange(key, 1e24);
+        uint256 amount = uint256(uint128(type(int128).max));
+        imd.mint(address(this), amount);
+        uint256 swapperBefore = imd.balanceOf(address(this));
+        uint256 recipientBefore = imd.balanceOf(RECIPIENT);
+
+        _swapOn(key, !rnnnIsZero, -int256(amount));
+
+        uint256 fee = imd.balanceOf(RECIPIENT) - recipientBefore + hook.pendingFees();
+        assertEq(fee, amount / 100, "fee is 1% of the IMD the trader specified");
+        assertEq(swapperBefore - imd.balanceOf(address(this)), amount, "the whole input was taken");
+        assertGt(hook.pendingFees(), 0, "setup: the fee exceeded what the manager held and was deferred");
+        assertGe(imd.balanceOf(address(manager)), hook.pendingFees(), "the claim is backed");
+
+        hook.redeemPendingFees();
+        assertEq(imd.balanceOf(RECIPIENT) - recipientBefore, amount / 100);
+        assertEq(hook.pendingFees(), 0);
+    }
+
+    /// @dev An exact input the pool cannot express (above int128) fails whole, with and without the
+    /// hook: the hook's simulation passes the pool's own overflow through instead of inventing a fee
+    /// or a result of its own. No claim is minted and the recipient gets nothing.
+    function test_exactInputBuyAboveInt128RevertsWholeAndLeavesNoFeeBehind() public {
+        _addFullRange(key, 1e24);
+        PoolKey memory plainKey = PoolKey(key.currency0, key.currency1, POOL_FEE, TICK_SPACING, IHooks(address(0)));
+        manager.initialize(plainKey, SQRT_PRICE_1_1);
+        _addFullRange(plainKey, 1e24);
+        int256 amount = -int256(uint256(uint128(type(int128).max)) * 101);
+        imd.mint(address(this), uint256(-amount));
+
         vm.expectRevert();
-        hook.beforeSwap(address(this), key, params, "");
+        _swapOn(plainKey, !rnnnIsZero, amount);
+        vm.expectRevert();
+        _swapOn(key, !rnnnIsZero, amount);
+
+        assertEq(imd.balanceOf(RECIPIENT), 0);
+        assertEq(hook.pendingFees(), 0);
     }
 
     // ---------------------------------------------------------------------------------------------
