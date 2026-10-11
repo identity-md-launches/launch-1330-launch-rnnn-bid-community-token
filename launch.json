@@ -1,0 +1,31 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "RnnnFeeHook",
+    "constructorArgs": [
+      "$poolManager",
+      "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
+      "0x45c89d0cf0b8a05218506236fcfcb18da1d3ebe4"
+    ],
+    "permissions": [
+      "beforeInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "RnnnToken",
+    "name": "rnnn.bid",
+    "symbol": "RNNN",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "Implementation limitations relative to the requested every-swap payment: if the PoolManager lacks IMD to pay a fee during afterSwap, the hook records an ERC-6909 claim instead of transferring IMD immediately. Pending fees are paid by a later swap when the manager can cover both its current fee and all pending fees, or through permissionless redeemPendingFees, which pays as much as the manager can cover. When IMD is the specified currency, partial fills still charge 1% of the requested IMD amount, not the filled amount. RnnnFeeHook serves the rnnn.bid (RNNN)/IMD launch pool on Robinhood Chain (4663). Its constructor arguments are PoolManager, IMD and fee recipient, in that order, all immutable. The recipient is 0x45c89d0cf0b8a05218506236fcfcb18da1d3ebe4; fees are always IMD and are never swapped or sold for ETH or another token. The fee is floor(IMD amount * 100 / 10000): beforeSwap returns a specified delta for exact-input buys and exact-output sells, using the requested IMD amount; afterSwap returns an unspecified delta for exact-output buys and exact-input sells, using the pool's IMD delta. Direct payment uses PoolManager.take. There is no owner, pause, fee setter, token minting authority, upgrade function or other hook fee. Pending-fee redemption is permissionless and always pays the fixed recipient. Enabled callbacks and unlockCallback accept only the PoolManager. beforeInitialize requires IMD on either side, accepts the launch's 12500 LP fee and tick spacing 60, and does not restrict the initializer or the other currency. The hook therefore also accepts other IMD pools. It does not override the LP fee; the 1% hook fee is additional to the 1.25% LP fee. The hook address must carry permission bits 0x20cc. RnnnToken takes no constructor arguments and reports rnnn.bid, RNNN and 18 decimals. Existing Foundry tests cover funded buys and sells in both exact-input and exact-output modes, deferred fees and redemption, permission flags, callback access and absence of privileged functions. The pool initialPrice records the required reference value; the deployer derives the opening price from the separately versioned launch policy."
+}
