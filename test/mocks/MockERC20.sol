@@ -51,7 +51,7 @@ contract MockERC20 {
         emit Transfer(address(0), to, amount);
     }
 
-    function _transfer(address from, address to, uint256 amount) internal {
+    function _transfer(address from, address to, uint256 amount) internal virtual {
         require(balanceOf[from] >= amount, "MockERC20: balance");
         balanceOf[from] -= amount;
         balanceOf[to] += amount;

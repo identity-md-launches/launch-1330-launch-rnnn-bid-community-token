@@ -11,7 +11,8 @@ import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
-import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {BalanceDelta, toBalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {PoolModifyLiquidityTest} from "v4-core/src/test/PoolModifyLiquidityTest.sol";
@@ -141,14 +142,38 @@ contract RnnnFeeHookTest is Test {
         hook.afterDonate(address(this), key, 1, 1, "");
     }
 
-    /// @dev Even the PoolManager cannot drive the hook's accounting through a direct callback: a
-    /// fake `afterSwap` from the manager's address outside a swap finds the manager locked.
+    /// @dev Even the PoolManager cannot drive the hook's accounting through a direct callback. A
+    /// fake `afterSwap` from the manager's address outside a swap finds the manager locked when it
+    /// tries to take a fee; and when IMD is the specified currency it finds no fee at all, because
+    /// only a real `beforeSwap` records one, so it moves nothing.
     function test_afterSwapOutsideAnUnlockReverts() public {
         _addFullRangeLiquidity(1e24);
-        SwapParams memory params = SwapParams(!rnnnIsZero, -100 ether, _limit(!rnnnIsZero));
+        BalanceDelta imdOut = rnnnIsZero ? toBalanceDelta(-100 ether, 100 ether) : toBalanceDelta(100 ether, -100 ether);
+        SwapParams memory sellExactIn = SwapParams(rnnnIsZero, -100 ether, _limit(rnnnIsZero));
         vm.prank(address(manager));
         vm.expectRevert();
-        hook.afterSwap(address(this), key, params, BalanceDelta.wrap(0), "");
+        hook.afterSwap(address(this), key, sellExactIn, imdOut, "");
+
+        SwapParams memory buyExactIn = SwapParams(!rnnnIsZero, -100 ether, _limit(!rnnnIsZero));
+        uint256 recipientBefore = imd.balanceOf(RECIPIENT);
+        vm.prank(address(manager));
+        (bytes4 selector, int128 hookDelta) = hook.afterSwap(address(this), key, buyExactIn, imdOut, "");
+        assertEq(selector, IHooks.afterSwap.selector);
+        assertEq(hookDelta, 0);
+        assertEq(imd.balanceOf(RECIPIENT), recipientBefore);
+        assertEq(hook.pendingFees(), 0);
+    }
+
+    function test_simulateSwapRefusesEveryoneButTheHook() public {
+        SwapParams memory params = SwapParams(!rnnnIsZero, -100 ether, _limit(!rnnnIsZero));
+        vm.expectRevert(RnnnFeeHook.NotSelf.selector);
+        hook.simulateSwap(key, params);
+        vm.prank(stranger);
+        vm.expectRevert(RnnnFeeHook.NotSelf.selector);
+        hook.simulateSwap(key, params);
+        vm.prank(address(manager));
+        vm.expectRevert(RnnnFeeHook.NotSelf.selector);
+        hook.simulateSwap(key, params);
     }
 
     function test_unusedCallbacksRevertEvenFromTheManager() public {
@@ -263,6 +288,18 @@ contract RnnnFeeHookTest is Test {
         PoolKey memory badKey = _keyFor(Currency.wrap(address(0)), Currency.wrap(address(rnnn)), POOL_FEE, 60);
         vm.expectRevert();
         manager.initialize(badKey, SQRT_PRICE_1_1);
+    }
+
+    /// @dev The hook never sets an LP fee, so a dynamic-fee pool on it would trade at a 0 LP fee
+    /// forever. It is refused; the launch pool's static 12500 is unaffected.
+    function test_initializeRefusesADynamicFeePool() public {
+        MockERC20 other = new MockERC20("Other", "OTHER", 1e24);
+        PoolKey memory dynamicKey =
+            _keyFor(Currency.wrap(address(other)), Currency.wrap(address(imd)), LPFeeLibrary.DYNAMIC_FEE_FLAG, 60);
+        vm.expectRevert();
+        manager.initialize(dynamicKey, SQRT_PRICE_1_1);
+        PoolKey memory staticKey = _keyFor(Currency.wrap(address(other)), Currency.wrap(address(imd)), POOL_FEE, 60);
+        manager.initialize(staticKey, SQRT_PRICE_1_1);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -485,6 +522,26 @@ contract RnnnFeeHookTest is Test {
         assertEq(hook.pendingFees(), 0);
     }
 
+    /// @dev Direct payment needs the manager to hold the fee *before* the swap's own input is
+    /// settled, so a buy whose fee exceeds the IMD the manager already holds is deferred even after
+    /// the pool has traded. The claim is backed and redeemable.
+    function test_largeBuyAfterTheFirstTrade_isDeferredWhenTheManagerHoldsLessThanTheFee() public {
+        _addRnnnOnlyLiquidity(1e24);
+        _buyExactIn(100 ether);
+        hook.redeemPendingFees();
+        uint256 recipientBefore = imd.balanceOf(RECIPIENT);
+        assertEq(imd.balanceOf(address(manager)), 99 ether);
+
+        _buyExactIn(1_000_000 ether);
+
+        assertEq(imd.balanceOf(RECIPIENT), recipientBefore, "the manager held 99 IMD, less than the 10,000 fee");
+        assertEq(hook.pendingFees(), 10_000 ether);
+        hook.redeemPendingFees();
+        assertEq(imd.balanceOf(RECIPIENT) - recipientBefore, 10_000 ether);
+        assertEq(hook.pendingFees(), 0);
+        _assertImdConserved();
+    }
+
     function test_redeemPendingFeesRevertsWhenNothingIsPending() public {
         vm.expectRevert(RnnnFeeHook.NothingToRedeem.selector);
         hook.redeemPendingFees();
@@ -495,8 +552,201 @@ contract RnnnFeeHookTest is Test {
     }
 
     // ---------------------------------------------------------------------------------------------
+    // Short fills: the fee is 1% of the IMD the pool actually moved
+    // ---------------------------------------------------------------------------------------------
+
+    /// @dev An exact-input buy stopped by the trader's price limit fills a sliver of the request.
+    /// The fee is 1% of that sliver, the trader pays sliver + fee, and the pool ends exactly at the
+    /// limit, as it would without a hook.
+    function test_buyExactInputWithPriceLimit_feeIsOnePercentOfTheFill() public {
+        _addFullRangeLiquidity(1e24);
+        uint256 requested = 1_000_000 ether;
+        bool zeroForOne = !rnnnIsZero;
+        uint160 limit = _limitTicksAway(zeroForOne, 60);
+        Snapshot memory s = _snapshot();
+
+        BalanceDelta delta = _swapWithLimit(zeroForOne, -int256(requested), limit);
+
+        uint256 fee = imd.balanceOf(RECIPIENT) - s.recipientImd;
+        uint256 filled = imd.balanceOf(address(manager)) - s.managerImd;
+        uint256 paid = s.swapperImd - imd.balanceOf(address(this));
+        assertLt(filled, requested / 2, "setup: the fill is partial");
+        assertGt(fee, 0);
+        assertEq(fee, filled / 100, "fee is not 1% of the IMD the pool took");
+        assertEq(paid, filled + fee, "trader paid other than fill + fee");
+        assertEq(uint256(uint128(-_imdDelta(delta))), paid);
+        (uint160 price,,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        assertEq(price, limit, "the pool did not stop at the trader's limit");
+        assertEq(hook.pendingFees(), 0);
+        _assertHookHoldsNothing();
+        _assertImdConserved();
+    }
+
+    /// @dev The same short fill on the launch-shaped pool, where the manager holds no IMD yet: the
+    /// fee is still 1% of the fill, deferred as a claim, and redeemable.
+    function test_buyExactInputWithPriceLimitOnRnnnOnlyPool_feeIsOnePercentOfTheFillAndDeferred() public {
+        _addRnnnOnlyLiquidity(1e24);
+        uint256 requested = 1_000_000 ether;
+        bool zeroForOne = !rnnnIsZero;
+        Snapshot memory s = _snapshot();
+
+        _swapWithLimit(zeroForOne, -int256(requested), _limitTicksAway(zeroForOne, 120));
+
+        uint256 fee = hook.pendingFees();
+        uint256 paid = s.swapperImd - imd.balanceOf(address(this));
+        uint256 filled = imd.balanceOf(address(manager)) - fee;
+        assertLt(filled, requested / 2, "setup: the fill is partial");
+        assertGt(fee, 0);
+        assertEq(fee, filled / 100, "fee is not 1% of the IMD the pool took");
+        assertEq(paid, filled + fee);
+        assertEq(imd.balanceOf(RECIPIENT), s.recipientImd);
+        hook.redeemPendingFees();
+        assertEq(imd.balanceOf(RECIPIENT) - s.recipientImd, fee);
+        _assertImdConserved();
+    }
+
+    /// @dev On the launch-shaped pool nothing can be sold before the first buy: the pool moves no
+    /// RNNN and no IMD, so the fee is 0 and the seller's IMD is untouched.
+    function test_sellExactOutputThatFillsNothing_takesNoFee() public {
+        _addRnnnOnlyLiquidity(1e24);
+        Snapshot memory s = _snapshot();
+
+        BalanceDelta delta = _sellExactOut(100 ether);
+
+        assertEq(BalanceDelta.unwrap(delta), 0, "the pool should have moved nothing");
+        assertEq(rnnn.balanceOf(address(this)), s.swapperRnnn);
+        assertEq(imd.balanceOf(address(this)), s.swapperImd, "a sell made the trader pay IMD");
+        assertEq(imd.balanceOf(RECIPIENT), s.recipientImd);
+        assertEq(hook.pendingFees(), 0);
+        assertEq(imd.balanceOf(address(manager)), 0);
+    }
+
+    function test_sellExactInputThatFillsNothing_takesNoFee() public {
+        _addRnnnOnlyLiquidity(1e24);
+        Snapshot memory s = _snapshot();
+        _sellExactIn(100 ether);
+        assertEq(rnnn.balanceOf(address(this)), s.swapperRnnn);
+        assertEq(imd.balanceOf(address(this)), s.swapperImd);
+        assertEq(imd.balanceOf(RECIPIENT), s.recipientImd);
+        assertEq(hook.pendingFees(), 0);
+    }
+
+    /// @dev An exact-output sell that asks for more IMD than the pool serves before the trader's
+    /// limit gets the partial payout less 1% of it; the fee is 1% of what the pool paid out.
+    function test_sellExactOutputWithPriceLimit_feeIsOnePercentOfThePayout() public {
+        _addFullRangeLiquidity(1e24);
+        uint256 requested = 1_000_000 ether;
+        bool zeroForOne = rnnnIsZero;
+        uint160 limit = _limitTicksAway(zeroForOne, 6_000);
+        Snapshot memory s = _snapshot();
+
+        BalanceDelta delta = _swapWithLimit(zeroForOne, int256(requested), limit);
+
+        uint256 fee = imd.balanceOf(RECIPIENT) - s.recipientImd;
+        uint256 payout = s.managerImd - imd.balanceOf(address(manager));
+        uint256 received = imd.balanceOf(address(this)) - s.swapperImd;
+        assertLt(payout, requested, "setup: the fill is partial");
+        assertGt(fee, 0);
+        assertEq(fee, payout / 100, "fee is not 1% of the IMD the pool paid out");
+        assertEq(received, payout - fee);
+        assertEq(uint256(uint128(_imdDelta(delta))), received);
+        assertLt(rnnn.balanceOf(address(this)), s.swapperRnnn);
+        (uint160 price,,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        assertEq(price, limit);
+        assertEq(hook.pendingFees(), 0);
+        _assertHookHoldsNothing();
+        _assertImdConserved();
+    }
+
+    function test_sellExactOutputWithOneSpacingLimit_feeIsOnePercentOfThePayout() public {
+        _addFullRangeLiquidity(1e21);
+        bool zeroForOne = rnnnIsZero;
+        Snapshot memory s = _snapshot();
+        _swapWithLimit(zeroForOne, int256(100 ether), _limitTicksAway(zeroForOne, 60));
+        uint256 fee = imd.balanceOf(RECIPIENT) - s.recipientImd;
+        uint256 payout = s.managerImd - imd.balanceOf(address(manager));
+        assertLt(payout, 100 ether, "setup: the fill is partial");
+        assertEq(fee, payout / 100);
+        assertEq(imd.balanceOf(address(this)) - s.swapperImd, payout - fee);
+        _assertImdConserved();
+    }
+
+    /// @dev A "buy up to this price" expressed as an enormous exact input with a limit fills the
+    /// hooked pool exactly as it fills a hookless one; the fee is 1% of that fill.
+    function test_hugeExactInputBuyWithLimit_fillsLikeAPoolWithoutAHook() public {
+        _addFullRangeLiquidity(1e24);
+        PoolKey memory plainKey = PoolKey(key.currency0, key.currency1, POOL_FEE, TICK_SPACING, IHooks(address(0)));
+        manager.initialize(plainKey, SQRT_PRICE_1_1);
+        lpRouter.modifyLiquidity(
+            plainKey,
+            ModifyLiquidityParams(
+                TickMath.minUsableTick(TICK_SPACING), TickMath.maxUsableTick(TICK_SPACING), 1e24, bytes32(0)
+            ),
+            ""
+        );
+        bool zeroForOne = !rnnnIsZero;
+        uint160 limit = _limitTicksAway(zeroForOne, 600);
+        int256 requested = -1e45;
+
+        uint256 managerBefore = imd.balanceOf(address(manager));
+        swapRouter.swap(plainKey, SwapParams(zeroForOne, requested, limit), PoolSwapTest.TestSettings(false, false), "");
+        uint256 plainFilled = imd.balanceOf(address(manager)) - managerBefore;
+        assertGt(plainFilled, 0);
+
+        Snapshot memory s = _snapshot();
+        _swapWithLimit(zeroForOne, requested, limit);
+        uint256 fee = imd.balanceOf(RECIPIENT) - s.recipientImd;
+        uint256 hookedFilled = imd.balanceOf(address(manager)) - s.managerImd;
+        assertEq(hookedFilled, plainFilled, "the hooked pool filled differently");
+        assertEq(fee, plainFilled / 100);
+        assertEq(s.swapperImd - imd.balanceOf(address(this)), plainFilled + fee);
+    }
+
+    /// @dev A limit that is already exceeded fails the same way with and without the hook: the
+    /// simulation passes the pool's own revert through.
+    function test_exceededPriceLimitRevertsLikeAPoolWithoutAHook() public {
+        _addFullRangeLiquidity(1e24);
+        bool zeroForOne = !rnnnIsZero;
+        uint160 wrongWay = _limitTicksAway(!zeroForOne, 60);
+        vm.expectRevert();
+        _swapWithLimit(zeroForOne, -100 ether, wrongWay);
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // Fuzz: the fee is exactly 1% whatever the size
     // ---------------------------------------------------------------------------------------------
+
+    function testFuzz_buyExactInputWithLimit_feeIsOnePercentOfTheFill(uint256 amountIn, uint24 ticks) public {
+        _addFullRangeLiquidity(1e24);
+        amountIn = bound(amountIn, 100, 1e25);
+        ticks = uint24(bound(ticks, 1, 20_000));
+        bool zeroForOne = !rnnnIsZero;
+        Snapshot memory s = _snapshot();
+        _swapWithLimit(zeroForOne, -int256(amountIn), _limitTicksAway(zeroForOne, int24(ticks)));
+        uint256 fee = imd.balanceOf(RECIPIENT) - s.recipientImd;
+        uint256 filled = imd.balanceOf(address(manager)) - s.managerImd;
+        uint256 paid = s.swapperImd - imd.balanceOf(address(this));
+        assertEq(paid, filled + fee);
+        if (paid == amountIn) assertEq(fee, amountIn / 100, "full fill: 1% of the trader's IMD");
+        else assertEq(fee, filled / 100, "short fill: 1% of the IMD the pool took");
+        _assertImdConserved();
+    }
+
+    function testFuzz_sellExactOutputWithLimit_feeIsOnePercentOfThePayout(uint256 imdOut, uint24 ticks) public {
+        _addFullRangeLiquidity(1e24);
+        imdOut = bound(imdOut, 100, 1e25);
+        ticks = uint24(bound(ticks, 1, 20_000));
+        bool zeroForOne = rnnnIsZero;
+        Snapshot memory s = _snapshot();
+        _swapWithLimit(zeroForOne, int256(imdOut), _limitTicksAway(zeroForOne, int24(ticks)));
+        uint256 fee = imd.balanceOf(RECIPIENT) - s.recipientImd;
+        uint256 payout = s.managerImd - imd.balanceOf(address(manager));
+        uint256 received = imd.balanceOf(address(this)) - s.swapperImd;
+        assertEq(received + fee, payout);
+        if (received == imdOut) assertEq(fee, imdOut / 100, "full fill: 1% of the trader's IMD");
+        else assertEq(fee, payout / 100, "short fill: 1% of the IMD the pool paid");
+        _assertImdConserved();
+    }
 
     function testFuzz_buyExactInput_feeIsExactlyOnePercent(uint256 amountIn) public {
         _addFullRangeLiquidity(1e26);
@@ -626,12 +876,18 @@ contract RnnnFeeHookTest is Test {
         return zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
     }
 
+    /// @dev A price limit `ticks` ticks past the current 1:1 price in the swap's direction.
+    function _limitTicksAway(bool zeroForOne, int24 ticks) internal pure returns (uint160) {
+        return TickMath.getSqrtPriceAtTick(zeroForOne ? -ticks : ticks);
+    }
+
     function _swap(bool zeroForOne, int256 amountSpecified) internal returns (BalanceDelta) {
+        return _swapWithLimit(zeroForOne, amountSpecified, _limit(zeroForOne));
+    }
+
+    function _swapWithLimit(bool zeroForOne, int256 amountSpecified, uint160 limit) internal returns (BalanceDelta) {
         return swapRouter.swap(
-            key,
-            SwapParams(zeroForOne, amountSpecified, _limit(zeroForOne)),
-            PoolSwapTest.TestSettings(false, false),
-            ""
+            key, SwapParams(zeroForOne, amountSpecified, limit), PoolSwapTest.TestSettings(false, false), ""
         );
     }
 
