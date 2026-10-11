@@ -1,0 +1,1 @@
+forge-std vendored from https://github.com/foundry-rs/forge-std at commit 0258fe875e1d8e207c1eb7175e542ea32356773c (master, 2026-10-05; src/ and licenses only). Chosen over the v1.9.7 tag because the floor suite calls fail(string).

@@ -1,0 +1,1 @@
+v4-core vendored from https://github.com/Uniswap/v4-core at 46c6834698c48bc4a463a86d8420f4eb1d7f3b75 (src/, test/utils/CurrencySettler.sol, licenses/). Files under src/test that import forge-std, solmate or openzeppelin were dropped.
